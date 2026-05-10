@@ -52,6 +52,7 @@ You can also run the MCP server through GitHub without publishing to npmjs and w
 
 Requirements:
 
+- the repository is public when using the `github:Shaar-games/gmod_mcp#latest` npm shortcut
 - the repository has a GitHub Release/tag, for example `latest`
 - the release contains one of these assets:
   - `gmod_mcp_windows_386.exe` (preferred)
