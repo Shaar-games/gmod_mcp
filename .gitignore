@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+gmod_mcp
+
+# Build output
+/build/
+/bin/
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Go
+vendor/
+
+.cursor/
