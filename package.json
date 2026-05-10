@@ -1,0 +1,26 @@
+{
+  "name": "gmod-mcp",
+  "version": "1.3.0",
+  "private": false,
+  "description": "MCP server for controlling and inspecting a local Garry's Mod client.",
+  "bin": {
+    "gmod-mcp": "scripts/gmod-mcp.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "os": [
+    "win32"
+  ],
+  "files": [
+    "scripts/",
+    "dist/.gitkeep",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shaar-games/gmod_mcp.git"
+  },
+  "license": "MIT"
+}

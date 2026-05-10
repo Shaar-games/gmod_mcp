@@ -6,6 +6,8 @@ gmod_mcp
 /build/
 /bin/
 /dist/
+!/dist/
+!/dist/.gitkeep
 
 # IDE
 .idea/

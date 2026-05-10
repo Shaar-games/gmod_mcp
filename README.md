@@ -46,6 +46,61 @@ Cursor project config example:
 
 After rebuilding `bin\gmod_mcp.exe`, reload Cursor or restart the MCP server so the new binary is used.
 
+### GitHub + npx
+
+You can also run the MCP server through GitHub without publishing to npmjs and without committing the `.exe`.
+
+Requirements:
+
+- the repository has a GitHub Release/tag, for example `latest`
+- the release contains one of these assets:
+  - `gmod_mcp_windows_386.exe` (preferred)
+  - `gmod_mcp.exe`
+
+Cursor config:
+
+```json
+{
+  "mcpServers": {
+    "gmod": {
+      "command": "npx",
+      "args": ["-y", "github:Shaar-games/gmod_mcp#latest"]
+    }
+  }
+}
+```
+
+How it works:
+
+- `npx` installs this repo from GitHub.
+- `postinstall` downloads the `.exe` from `https://github.com/Shaar-games/gmod_mcp/releases/download/latest/...`.
+- The npm launcher starts the downloaded local binary from `dist/win32/gmod_mcp.exe`.
+
+Use another release tag:
+
+```powershell
+$env:GMOD_MCP_RELEASE_TAG = "v1.0.0"
+npx -y github:Shaar-games/gmod_mcp#v1.0.0
+```
+
+Cursor config with a specific release tag:
+
+```json
+{
+  "mcpServers": {
+    "gmod": {
+      "command": "npx",
+      "args": ["-y", "github:Shaar-games/gmod_mcp#v1.0.0"],
+      "env": {
+        "GMOD_MCP_RELEASE_TAG": "v1.0.0"
+      }
+    }
+  }
+}
+```
+
+If your release asset has a custom name, set `GMOD_MCP_ASSET_NAME`.
+
 ## Tools
 
 ### `LaunchGame`
