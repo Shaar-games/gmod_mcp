@@ -1,64 +1,68 @@
 # gmod_mcp
 
-MCP server for controlling and inspecting a local Garry's Mod client.
+MCP server for controlling and inspecting a local Garry's Mod client on Windows.
 
-The server is Windows-only and talks to the running `gmod.exe` process directly. It can launch the game through Steam, detect whether the main game client is ready, run Source Engine console commands, and read the developer console history from process memory.
+It can:
+
+- launch Garry's Mod through Steam
+- detect whether the game is open, ready, in the menu, in singleplayer, or connected to a server
+- run Source Engine console commands
+- read the developer console history directly from memory
+
+The MCP server must run on the same Windows machine as Garry's Mod.
 
 ## Requirements
 
 - Windows
-- Go 1.24+ for building from source
 - Garry's Mod installed through Steam
-- A 32-bit build target (`GOARCH=386`)
-- The MCP server must run as a user that can open the Garry's Mod process
+- Node.js/npm if installing through `npx`
+- The release asset `gmod_mcp.exe` must exist on the GitHub release/tag used by the installer
 
-## Build
+## Quick Install
 
-PowerShell:
-
-```powershell
-.\build.cmd
-```
-
-The script builds `bin\gmod_mcp.exe` with `GOOS=windows` and `GOARCH=386`.
-
-Clean rebuild:
+This project is designed to run through GitHub with `npx`. The repository must be public for the `github:` npm shortcut to work.
 
 ```powershell
-.\build.cmd clean
+npx -y github:Shaar-games/gmod_mcp#latest
 ```
 
-`GOARCH=386` is required because Garry's Mod is a 32-bit process.
+During install, npm downloads `gmod_mcp.exe` from:
 
-## MCP Configuration
+```text
+https://github.com/Shaar-games/gmod_mcp/releases/download/latest/gmod_mcp.exe
+```
 
-Cursor project config example:
+To use a different release tag, install that git tag and set the release tag used by the downloader:
+
+```powershell
+$env:GMOD_MCP_RELEASE_TAG = "v1.0.0"
+npx -y github:Shaar-games/gmod_mcp#v1.0.0
+```
+
+## Cursor
+
+### One-Click Install
+
+[Install gmod_mcp in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=gmod&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImdpdGh1YjpTaGFhci1nYW1lcy9nbW9kX21jcCNsYXRlc3QiXX0%3D)
+
+If your browser does not open Cursor from the link, copy and paste this into the address bar:
+
+```text
+cursor://anysphere.cursor-deeplink/mcp/install?name=gmod&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImdpdGh1YjpTaGFhci1nYW1lcy9nbW9kX21jcCNsYXRlc3QiXX0%3D
+```
+
+Cursor will show the command before installing it. It should be:
 
 ```json
 {
-  "mcpServers": {
-    "gmod": {
-      "command": "C:\\Users\\shaar\\Documents\\Dev\\gmod_mcp\\bin\\gmod_mcp.exe"
-    }
-  }
+  "command": "npx",
+  "args": ["-y", "github:Shaar-games/gmod_mcp#latest"]
 }
 ```
 
-After rebuilding `bin\gmod_mcp.exe`, reload Cursor or restart the MCP server so the new binary is used.
+### Manual Cursor Config
 
-### GitHub + npx
-
-You can also run the MCP server through GitHub without publishing to npmjs and without committing the `.exe`.
-
-Requirements:
-
-- the repository is public when using the `github:Shaar-games/gmod_mcp#latest` npm shortcut
-- the repository has a GitHub Release/tag, for example `latest`
-- the release contains one of these assets:
-  - `gmod_mcp_windows_386.exe` (preferred)
-  - `gmod_mcp.exe`
-
-Cursor config:
+Add this MCP server in Cursor settings, or place it in your Cursor MCP config:
 
 ```json
 {
@@ -71,11 +75,81 @@ Cursor config:
 }
 ```
 
-How it works:
+Restart/reload Cursor after changing MCP configuration.
 
-- `npx` installs this repo from GitHub.
-- `postinstall` downloads the `.exe` from `https://github.com/Shaar-games/gmod_mcp/releases/download/latest/...`.
-- The npm launcher starts the downloaded local binary from `dist/win32/gmod_mcp.exe`.
+## Claude
+
+### Claude Desktop
+
+Open Claude Desktop settings, go to Developer settings, then edit the MCP configuration. Add:
+
+```json
+{
+  "mcpServers": {
+    "gmod": {
+      "command": "npx",
+      "args": ["-y", "github:Shaar-games/gmod_mcp#latest"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving the config.
+
+### Claude Code
+
+Claude Code can add the same stdio server from JSON:
+
+```powershell
+claude mcp add-json gmod "{\"type\":\"stdio\",\"command\":\"npx\",\"args\":[\"-y\",\"github:Shaar-games/gmod_mcp#latest\"]}" --scope user
+```
+
+Verify:
+
+```powershell
+claude mcp get gmod
+```
+
+## Codex
+
+Add the server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gmod]
+command = "npx"
+args = ["-y", "github:Shaar-games/gmod_mcp#latest"]
+enabled = true
+```
+
+Restart Codex after editing the config.
+
+## GitHub Copilot / VS Code
+
+For GitHub Copilot Chat in VS Code, create or edit `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "gmod": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "github:Shaar-games/gmod_mcp#latest"]
+    }
+  }
+}
+```
+
+Then use the VS Code command palette:
+
+```text
+MCP: List Servers
+```
+
+Start the `gmod` server if VS Code does not start it automatically.
+
+## Release Tag and Asset Name
+
+By default, the npm installer downloads from the `latest` release tag and looks for `gmod_mcp.exe`.
 
 Use another release tag:
 
@@ -84,31 +158,20 @@ $env:GMOD_MCP_RELEASE_TAG = "v1.0.0"
 npx -y github:Shaar-games/gmod_mcp#v1.0.0
 ```
 
-Cursor config with a specific release tag:
+Use a custom release asset name:
 
-```json
-{
-  "mcpServers": {
-    "gmod": {
-      "command": "npx",
-      "args": ["-y", "github:Shaar-games/gmod_mcp#v1.0.0"],
-      "env": {
-        "GMOD_MCP_RELEASE_TAG": "v1.0.0"
-      }
-    }
-  }
-}
+```powershell
+$env:GMOD_MCP_ASSET_NAME = "my-custom-name.exe"
+npx -y github:Shaar-games/gmod_mcp#latest
 ```
-
-If your release asset has a custom name, set `GMOD_MCP_ASSET_NAME`.
 
 ## Tools
 
 ### `LaunchGame`
 
-Asks Steam to launch Garry's Mod with `steam://run/4000`, then waits until the main game process is ready or a timeout is reached.
+Launches Garry's Mod through Steam with `steam://run/4000`, then waits until the main game process is ready or a timeout is reached.
 
-This tool does not expose an app id. It is intentionally locked to Garry's Mod.
+This tool is locked to Garry's Mod. It does not expose a configurable Steam app id.
 
 Parameters:
 
@@ -169,6 +232,61 @@ Parameters:
 | `processName` | string | No | Process image name to search for. Default: `gmod.exe`. |
 | `pid` | int | No | Specific Garry's Mod process id. Overrides `processName`. |
 
+## Troubleshooting
+
+### `package.json` not found
+
+Make sure you are using a tag that includes the npm wrapper files:
+
+```powershell
+npx -y github:Shaar-games/gmod_mcp#latest
+```
+
+If npm cached an old broken install:
+
+```powershell
+npm cache clean --force
+```
+
+### Release asset download fails
+
+Check that this URL exists in a browser:
+
+```text
+https://github.com/Shaar-games/gmod_mcp/releases/download/latest/gmod_mcp.exe
+```
+
+If you use another tag, replace `latest` with that tag.
+
+### MCP starts but no tools appear
+
+Restart the MCP client after installation. Some clients cache the available tools until the server is restarted.
+
+## Building From Source
+
+This section is for contributors.
+
+Requirements:
+
+- Windows
+- Go 1.24+
+
+Build:
+
+```powershell
+.\build.cmd
+```
+
+The script builds `bin\gmod_mcp.exe` with `GOOS=windows` and `GOARCH=386`.
+
+Clean rebuild:
+
+```powershell
+.\build.cmd clean
+```
+
+`GOARCH=386` is required because Garry's Mod is a 32-bit process.
+
 ## Local CLI Tests
 
 The `cmd/` programs are small debug entry points for testing behavior without MCP.
@@ -203,24 +321,6 @@ Read console output from memory:
 go run ./cmd/readconsole -lines 50
 ```
 
-## Architecture
-
-```text
-gmod_mcp/
-|-- main.go
-|-- go.mod
-|-- cmd/
-|   |-- gamestatus/
-|   |-- launchgame/
-|   |-- readconsole/
-|   `-- runconsole/
-|-- internal/
-|   `-- gmod/
-|       |-- gmod.go
-|       `-- proc_windows.go
-`-- README.md
-```
-
 ## Technical Notes
 
 - `RunConsoleCommand` resolves `IVEngineClient015` from `client.dll` at RVA `0x7BD390`.
@@ -229,10 +329,6 @@ gmod_mcp/
 - Local/server classification uses the clientside game rules max-player value at `client.dll` RVA `0x717050` plus offset `0x1C`.
 - `GetConsoleOutput` reads `engine.dll` globals at RVAs `0x42F070` and `0x42F07C`.
 - These RVAs are tied to the analyzed Garry's Mod build and may need updates after game patches.
-
-## Distribution Notes
-
-For GitHub-based distribution without committing `gmod_mcp.exe`, publish the binary as a GitHub Release asset and use an installer or launcher script to download it locally. The MCP client still needs to execute a local binary because the server must access the local Garry's Mod process.
 
 ## License
 
