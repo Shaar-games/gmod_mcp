@@ -287,6 +287,35 @@ Clean rebuild:
 
 `GOARCH=386` is required because Garry's Mod is a 32-bit process.
 
+## Creating a GitHub Release
+
+This section is for maintainers.
+
+Requirements:
+
+- GitHub CLI installed
+- authenticated with `gh auth login`
+- tracked git files committed before release
+
+Create a release from the current branch:
+
+```powershell
+.\release.cmd v1.3.0
+```
+
+The script:
+
+- builds `bin\gmod_mcp.exe`
+- tags the current commit with the tag argument
+- pushes the tag to `origin`
+- creates a GitHub release
+- uploads `bin\gmod_mcp.exe` as `gmod_mcp.exe`
+- uses this release note:
+
+```text
+Full Changelog: https://github.com/Shaar-games/gmod_mcp/commits/{tag name}
+```
+
 ## Local CLI Tests
 
 The `cmd/` programs are small debug entry points for testing behavior without MCP.
