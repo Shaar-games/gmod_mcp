@@ -43,13 +43,7 @@ npx -y github:Shaar-games/gmod_mcp#v1.0.0
 
 ### One-Click Install
 
-[Install gmod_mcp in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=gmod&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImdpdGh1YjpTaGFhci1nYW1lcy9nbW9kX21jcCNsYXRlc3QiXX0%3D)
-
-If your browser does not open Cursor from the link, copy and paste this into the address bar:
-
-```text
-cursor://anysphere.cursor-deeplink/mcp/install?name=gmod&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImdpdGh1YjpTaGFhci1nYW1lcy9nbW9kX21jcCNsYXRlc3QiXX0%3D
-```
+[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en-US/install-mcp?name=gmod&config=eyJjb21tYW5kIjoibnB4IC15IGdpdGh1YjpTaGFhci1nYW1lcy9nbW9kX21jcCNsYXRlc3QifQ%3D%3D)
 
 Cursor will show the command before installing it. It should be:
 
