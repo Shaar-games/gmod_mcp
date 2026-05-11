@@ -1,8 +1,7 @@
 //go:build windows && 386
 
-// Package gmod provides functions to execute console commands in a running
-// Garry's Mod (Source Engine) process by resolving IVEngineClient015 from
-// client.dll and invoking ClientCmd via remote thread injection.
+// Package gmod provides functions to inspect and control a running Garry's Mod
+// client process.
 package gmod
 
 import (
@@ -19,28 +18,30 @@ const (
 	defaultProcessName = "gmod.exe"
 	garrysModSteamID   = 4000
 
-	engineClientRVA  = 0x7BD390 // dword_107BD390 in client.dll — stores CreateInterface("VEngineClient015") result
-	clientCmdVtblOff = 28       // IVEngineClient vtable[7] = ClientCmd offset
-	isInGameVtblOff  = 0x68     // IVEngineClient::IsInGame
-	gameRulesPtrRVA  = 0x717050 // off_10717050; +0x1C stores max players on the analyzed client.dll build.
-
-	// engine.dll - console history linked list (matches sub_101F38C0 / crash dump path in the
-	// Garry's Mod engine.dll build analyzed with IDA).
-	// IDA image base: 0x10000000; globals: 0x1042F070 / 0x1042F07C.
-	// These offsets can change when Garry's Mod ships a different engine.dll.
-	engineConsoleNodesRVA = 0x42F070 // dword_1042F070 - pointer to node array (each node 8 bytes)
-	engineConsoleChainRVA = 0x42F07C // dword_1042F07C - console chain word; head index = HIWORD
+	clientCmdVtblOff    = 0x1C // IVEngineClient::ClientCmd
+	getMaxClientsOff    = 0x54 // IVEngineClient::GetMaxClients
+	isInGameVtblOff     = 0x68 // IVEngineClient::IsInGame
+	engineInterfaceName = "VEngineClient015"
 
 	maxConsoleWalk       = 8192
 	maxConsoleLineLength = 16384
 )
 
+type consoleGlobals struct {
+	nodesPtrAddr  uintptr
+	chainWordAddr uintptr
+}
+
 // GMod represents a connection to a running Garry's Mod process.
 type GMod struct {
-	handle     windows.Handle
-	pid        uint32
-	clientBase uintptr
-	engineBase uintptr
+	handle         windows.Handle
+	pid            uint32
+	clientBase     uintptr
+	clientSize     uint32
+	engineBase     uintptr
+	engineSize     uint32
+	engineIface    uint32
+	consoleGlobals consoleGlobals
 }
 
 type ModuleStatus struct {
@@ -112,24 +113,23 @@ func Status(processName string) (GameStatus, error) {
 	for _, pid := range pids {
 		process := ProcessStatus{PID: pid, SessionType: "loading"}
 
-		clientBase, clientErr := findModuleBase(pid, "client.dll")
+		clientInfo, clientErr := findModuleInfo(pid, "client.dll")
 		if clientErr == nil {
 			process.Client.Loaded = true
-			process.Client.Base = clientBase
+			process.Client.Base = clientInfo.Base
 		}
 
-		engineBase, engineErr := findModuleBase(pid, "engine.dll")
+		engineInfo, engineErr := findModuleInfo(pid, "engine.dll")
 		if engineErr == nil {
 			process.Engine.Loaded = true
-			process.Engine.Base = engineBase
+			process.Engine.Base = engineInfo.Base
 		}
 
 		if !process.Client.Loaded && !process.Engine.Loaded {
 			continue
 		}
 
-		modulesReady := process.Client.Loaded && process.Engine.Loaded
-		if modulesReady {
+		if process.Client.Loaded && process.Engine.Loaded {
 			conn, err := Connect(pid, exe)
 			if err != nil {
 				process.Error = err.Error()
@@ -222,12 +222,12 @@ func Connect(pid uint32, processName string) (*GMod, error) {
 		return nil, fmt.Errorf("resolve PID: %w", err)
 	}
 
-	clientBase, err := findModuleBase(resolvedPID, "client.dll")
+	clientInfo, err := findModuleInfo(resolvedPID, "client.dll")
 	if err != nil {
 		return nil, fmt.Errorf("find client.dll: %w", err)
 	}
 
-	engineBase, err := findModuleBase(resolvedPID, "engine.dll")
+	engineInfo, err := findModuleInfo(resolvedPID, "engine.dll")
 	if err != nil {
 		return nil, fmt.Errorf("find engine.dll: %w", err)
 	}
@@ -240,8 +240,10 @@ func Connect(pid uint32, processName string) (*GMod, error) {
 	return &GMod{
 		handle:     h,
 		pid:        resolvedPID,
-		clientBase: clientBase,
-		engineBase: engineBase,
+		clientBase: clientInfo.Base,
+		clientSize: clientInfo.Size,
+		engineBase: engineInfo.Base,
+		engineSize: engineInfo.Size,
 	}, nil
 }
 
@@ -268,23 +270,23 @@ func (g *GMod) EngineBase() uintptr {
 	return g.engineBase
 }
 
-// EngineInterfaceReady reports whether IVEngineClient015 is available in client.dll.
+// EngineInterfaceReady reports whether IVEngineClient015 is available.
 func (g *GMod) EngineInterfaceReady() (bool, error) {
-	ifacePtr, err := g.readEngineInterface()
+	ifacePtr, err := g.resolveEngineInterface()
 	if err != nil {
-		return false, fmt.Errorf("read engine interface: %w", err)
+		return false, fmt.Errorf("resolve engine interface: %w", err)
 	}
 	return ifacePtr != 0, nil
 }
 
 // IsInGame calls IVEngineClient::IsInGame in the target process.
 func (g *GMod) IsInGame() (bool, error) {
-	ifacePtr, err := g.readEngineInterface()
+	ifacePtr, err := g.resolveEngineInterface()
 	if err != nil {
-		return false, fmt.Errorf("read engine interface: %w", err)
+		return false, fmt.Errorf("resolve engine interface: %w", err)
 	}
 	if ifacePtr == 0 {
-		return false, fmt.Errorf("IVEngineClient015 is NULL")
+		return false, fmt.Errorf("%s is NULL", engineInterfaceName)
 	}
 
 	method, err := g.resolveEngineMethod(ifacePtr, isInGameVtblOff)
@@ -292,55 +294,52 @@ func (g *GMod) IsInGame() (bool, error) {
 		return false, fmt.Errorf("resolve IsInGame: %w", err)
 	}
 
-	stub := buildThiscallNoArgStub(uintptr(method), uintptr(ifacePtr))
-	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
-	if err != nil {
-		return false, fmt.Errorf("allocate IsInGame stub: %w", err)
-	}
-	defer freeRemote(g.handle, remoteStub)
-
-	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
-		return false, fmt.Errorf("write IsInGame stub: %w", err)
-	}
-
-	result, err := remoteCall(g.handle, remoteStub, 0)
+	result, err := g.callThiscallNoArg(method, ifacePtr)
 	if err != nil {
 		return false, fmt.Errorf("call IsInGame: %w", err)
 	}
 	return result != 0, nil
 }
 
-// MaxPlayers reads the clientside game rules max player count used by the Lua game.MaxPlayers binding.
+// MaxPlayers calls IVEngineClient::GetMaxClients in the target process.
 func (g *GMod) MaxPlayers() (int, error) {
-	gameRulesPtr, err := readRemoteUint32(g.handle, g.clientBase+uintptr(gameRulesPtrRVA))
+	ifacePtr, err := g.resolveEngineInterface()
 	if err != nil {
-		return 0, fmt.Errorf("read game rules pointer: %w", err)
+		return 0, fmt.Errorf("resolve engine interface: %w", err)
 	}
-	if gameRulesPtr == 0 {
+	if ifacePtr == 0 {
 		return 0, nil
 	}
-	maxPlayers, err := readRemoteUint32(g.handle, uintptr(gameRulesPtr)+0x1C)
+
+	method, err := g.resolveEngineMethod(ifacePtr, getMaxClientsOff)
 	if err != nil {
-		return 0, fmt.Errorf("read max players: %w", err)
+		return 0, fmt.Errorf("resolve GetMaxClients: %w", err)
 	}
-	return int(maxPlayers), nil
+
+	result, err := g.callThiscallNoArg(method, ifacePtr)
+	if err != nil {
+		return 0, fmt.Errorf("call GetMaxClients: %w", err)
+	}
+	return int(result), nil
 }
 
 // ReadConsoleLines walks the engine.dll console history linked list in remote memory.
 // The engine chain is newest-first on the Garry's Mod build this package targets.
 func (g *GMod) ReadConsoleLines() ([]string, error) {
-	nodesPtrAddr := g.engineBase + uintptr(engineConsoleNodesRVA)
-	chainWordAddr := g.engineBase + uintptr(engineConsoleChainRVA)
+	globals, err := g.resolveConsoleGlobals()
+	if err != nil {
+		return nil, err
+	}
 
-	nodesTable, err := readRemoteUint32(g.handle, nodesPtrAddr)
+	nodesTable, err := readRemoteUint32(g.handle, globals.nodesPtrAddr)
 	if err != nil {
 		return nil, fmt.Errorf("read console nodes pointer: %w", err)
 	}
 	if nodesTable == 0 {
-		return nil, fmt.Errorf("console node table is NULL (game still loading or offsets outdated)")
+		return nil, fmt.Errorf("console node table is NULL (game still loading or signatures outdated)")
 	}
 
-	chainWord, err := readRemoteUint32(g.handle, chainWordAddr)
+	chainWord, err := readRemoteUint32(g.handle, globals.chainWordAddr)
 	if err != nil {
 		return nil, fmt.Errorf("read console chain word: %w", err)
 	}
@@ -402,30 +401,30 @@ func RecentConsoleLines(lines []string, maxLines int) []string {
 
 // EngineConsoleRawGlobals returns the raw engine.dll values used for console history walking (debugging).
 func (g *GMod) EngineConsoleRawGlobals() (nodesTablePtr uint32, chainWord uint32, err error) {
-	nodesPtrAddr := g.engineBase + uintptr(engineConsoleNodesRVA)
-	chainWordAddr := g.engineBase + uintptr(engineConsoleChainRVA)
-	nodesTablePtr, err = readRemoteUint32(g.handle, nodesPtrAddr)
+	globals, err := g.resolveConsoleGlobals()
 	if err != nil {
 		return 0, 0, err
 	}
-	chainWord, err = readRemoteUint32(g.handle, chainWordAddr)
+	nodesTablePtr, err = readRemoteUint32(g.handle, globals.nodesPtrAddr)
+	if err != nil {
+		return 0, 0, err
+	}
+	chainWord, err = readRemoteUint32(g.handle, globals.chainWordAddr)
 	return nodesTablePtr, chainWord, err
 }
 
 // RunConsoleCommand executes a console command in the Garry's Mod process.
-// The command is injected via CreateRemoteThread calling ClientCmd on
-// the IVEngineClient015 interface.
 func (g *GMod) RunConsoleCommand(cmd string) error {
 	if strings.TrimSpace(cmd) == "" {
 		return fmt.Errorf("command cannot be empty")
 	}
 
-	ifacePtr, err := g.readEngineInterface()
+	ifacePtr, err := g.resolveEngineInterface()
 	if err != nil {
-		return fmt.Errorf("read engine interface: %w", err)
+		return fmt.Errorf("resolve engine interface: %w", err)
 	}
 	if ifacePtr == 0 {
-		return fmt.Errorf("IVEngineClient015 is NULL — game not fully initialized")
+		return fmt.Errorf("%s is NULL - game not fully initialized", engineInterfaceName)
 	}
 
 	clientCmdAddr, err := g.resolveClientCmd(ifacePtr)
@@ -461,12 +460,71 @@ func (g *GMod) RunConsoleCommand(cmd string) error {
 	return nil
 }
 
-// readEngineInterface reads the IVEngineClient015 interface pointer from client.dll.
-func (g *GMod) readEngineInterface() (uint32, error) {
-	return readRemoteUint32(g.handle, g.clientBase+uintptr(engineClientRVA))
+func (g *GMod) resolveEngineInterface() (uint32, error) {
+	if g.engineIface != 0 {
+		return g.engineIface, nil
+	}
+
+	createInterface, err := findRemoteExport(g.handle, g.engineBase, "CreateInterface")
+	if err != nil {
+		return 0, fmt.Errorf("find engine.dll CreateInterface: %w", err)
+	}
+
+	remoteName, err := allocRemote(g.handle, uintptr(len(engineInterfaceName)+1), pageReadwrite)
+	if err != nil {
+		return 0, fmt.Errorf("allocate interface name: %w", err)
+	}
+	defer freeRemote(g.handle, remoteName)
+
+	if err := writeRemote(g.handle, remoteName, append([]byte(engineInterfaceName), 0)); err != nil {
+		return 0, fmt.Errorf("write interface name: %w", err)
+	}
+
+	stub := buildCreateInterfaceStub(createInterface)
+	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
+	if err != nil {
+		return 0, fmt.Errorf("allocate CreateInterface stub: %w", err)
+	}
+	defer freeRemote(g.handle, remoteStub)
+
+	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
+		return 0, fmt.Errorf("write CreateInterface stub: %w", err)
+	}
+
+	result, err := remoteCall(g.handle, remoteStub, remoteName)
+	if err != nil {
+		return 0, fmt.Errorf("call CreateInterface: %w", err)
+	}
+	g.engineIface = uint32(result)
+	return g.engineIface, nil
 }
 
-// resolveClientCmd reads the vtable and resolves the ClientCmd function pointer.
+func (g *GMod) resolveConsoleGlobals() (consoleGlobals, error) {
+	if g.consoleGlobals.nodesPtrAddr != 0 && g.consoleGlobals.chainWordAddr != 0 {
+		return g.consoleGlobals, nil
+	}
+	globals, err := findConsoleGlobals(g.handle, g.engineBase, g.engineSize)
+	if err != nil {
+		return consoleGlobals{}, err
+	}
+	g.consoleGlobals = globals
+	return globals, nil
+}
+
+func (g *GMod) callThiscallNoArg(method uint32, thisPtr uint32) (uintptr, error) {
+	stub := buildThiscallNoArgStub(uintptr(method), uintptr(thisPtr))
+	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
+	if err != nil {
+		return 0, fmt.Errorf("allocate stub: %w", err)
+	}
+	defer freeRemote(g.handle, remoteStub)
+
+	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
+		return 0, fmt.Errorf("write stub: %w", err)
+	}
+	return remoteCall(g.handle, remoteStub, 0)
+}
+
 func (g *GMod) resolveClientCmd(ifacePtr uint32) (uint32, error) {
 	return g.resolveEngineMethod(ifacePtr, clientCmdVtblOff)
 }
@@ -494,7 +552,7 @@ func resolvePID(pid uint32, name string) (uint32, error) {
 		return 0, err
 	}
 	for _, p := range pids {
-		if _, err := findModuleBase(p, "client.dll"); err == nil {
+		if _, err := findModuleInfo(p, "client.dll"); err == nil {
 			return p, nil
 		}
 	}

@@ -346,12 +346,11 @@ go run ./cmd/readconsole -lines 50
 
 ## Technical Notes
 
-- `RunConsoleCommand` resolves `IVEngineClient015` from `client.dll` at RVA `0x7BD390`.
-- `ClientCmd` is called through vtable offset `28` using an injected x86 thiscall stub.
-- `GetGameStatus` checks `IVEngineClient::IsInGame` through vtable offset `0x68`.
-- Local/server classification uses the clientside game rules max-player value at `client.dll` RVA `0x717050` plus offset `0x1C`.
-- `GetConsoleOutput` reads `engine.dll` globals at RVAs `0x42F070` and `0x42F07C`.
-- These RVAs are tied to the analyzed Garry's Mod build and may need updates after game patches.
+- `IVEngineClient015` is resolved dynamically by calling `engine.dll!CreateInterface` inside the target process.
+- `RunConsoleCommand` calls `IVEngineClient::ClientCmd` through the `IVEngineClient015` vtable.
+- `GetGameStatus` calls `IVEngineClient::IsInGame` and `IVEngineClient::GetMaxClients` through the same interface.
+- `GetConsoleOutput` signature-scans `engine.dll` for the console dump walker and extracts the runtime console-list globals from the matched instructions.
+- The remaining vtable offsets are tied to the `IVEngineClient015` ABI instead of module RVAs.
 
 ## License
 
