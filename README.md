@@ -297,6 +297,12 @@ Create a release from the current branch:
 .\release.cmd v1.3.0
 ```
 
+Overwrite an existing release/tag intentionally:
+
+```powershell
+.\release.cmd v1.3.0 --force
+```
+
 The script:
 
 - builds `bin\gmod_mcp.exe`
@@ -309,6 +315,8 @@ The script:
 ```text
 Full Changelog: https://github.com/Shaar-games/gmod_mcp/commits/{tag name}
 ```
+
+Without `--force`, the script refuses to overwrite an existing local tag, remote tag, or GitHub release.
 
 ## Local CLI Tests
 

@@ -4,12 +4,22 @@ setlocal
 cd /d "%~dp0"
 
 if "%~1"=="" (
-    echo Usage: release.cmd ^<tag^>
+    echo Usage: release.cmd ^<tag^> [--force]
     echo Example: release.cmd v1.3.0
+    echo Example: release.cmd latest --force
     exit /b 2
 )
 
 set "TAG=%~1"
+set "FORCE=0"
+if /i "%~2"=="--force" set "FORCE=1"
+if /i "%~2"=="-f" set "FORCE=1"
+if not "%~2"=="" if "%FORCE%"=="0" (
+    echo Unknown option: %~2
+    echo Usage: release.cmd ^<tag^> [--force]
+    exit /b 2
+)
+
 set "ASSET=bin\gmod_mcp.exe"
 set "REPO=Shaar-games/gmod_mcp"
 set "NOTES=Full Changelog: https://github.com/%REPO%/commits/%TAG%"
@@ -42,14 +52,36 @@ for /f %%i in ('git status --porcelain --untracked-files=no') do (
 
 git rev-parse --verify "refs/tags/%TAG%" >nul 2>nul
 if not errorlevel 1 (
-    echo Tag "%TAG%" already exists locally.
-    exit /b 1
+    if "%FORCE%"=="0" (
+        echo Tag "%TAG%" already exists locally. Use --force to overwrite it.
+        exit /b 1
+    )
+    git tag -d "%TAG%" >nul
+    if errorlevel 1 (
+        echo Failed to delete local tag "%TAG%".
+        exit /b 1
+    )
 )
 
 git ls-remote --exit-code --tags origin "refs/tags/%TAG%" >nul 2>nul
 if not errorlevel 1 (
-    echo Tag "%TAG%" already exists on origin.
-    exit /b 1
+    if "%FORCE%"=="0" (
+        echo Tag "%TAG%" already exists on origin. Use --force to overwrite it.
+        exit /b 1
+    )
+)
+
+gh release view "%TAG%" --repo "%REPO%" >nul 2>nul
+if not errorlevel 1 (
+    if "%FORCE%"=="0" (
+        echo Release "%TAG%" already exists on GitHub. Use --force to overwrite it.
+        exit /b 1
+    )
+    gh release delete "%TAG%" --repo "%REPO%" --yes --cleanup-tag
+    if errorlevel 1 (
+        echo Failed to delete existing GitHub release "%TAG%".
+        exit /b 1
+    )
 )
 
 call "%~dp0build.cmd" clean
@@ -68,7 +100,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-git push origin "%TAG%"
+if "%FORCE%"=="1" (
+    git push origin "%TAG%" --force
+) else (
+    git push origin "%TAG%"
+)
 if errorlevel 1 (
     echo Failed to push tag "%TAG%".
     exit /b 1
