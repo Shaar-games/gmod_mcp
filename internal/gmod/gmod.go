@@ -6,6 +6,7 @@ package gmod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -330,6 +331,12 @@ func (g *GMod) ReadConsoleLines() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureRemoteReadable(g.handle, globals.nodesPtrAddr, 4); err != nil {
+		return nil, fmt.Errorf("console nodes pointer address is unsafe: %w", err)
+	}
+	if err := ensureRemoteReadable(g.handle, globals.chainWordAddr, 4); err != nil {
+		return nil, fmt.Errorf("console chain word address is unsafe: %w", err)
+	}
 
 	nodesTable, err := readRemoteUint32(g.handle, globals.nodesPtrAddr)
 	if err != nil {
@@ -337,6 +344,9 @@ func (g *GMod) ReadConsoleLines() ([]string, error) {
 	}
 	if nodesTable == 0 {
 		return nil, fmt.Errorf("console node table is NULL (game still loading or signatures outdated)")
+	}
+	if err := ensureRemoteReadable(g.handle, uintptr(nodesTable), 8); err != nil {
+		return nil, fmt.Errorf("console node table is unsafe: %w", err)
 	}
 
 	chainWord, err := readRemoteUint32(g.handle, globals.chainWordAddr)
@@ -359,6 +369,9 @@ func (g *GMod) ReadConsoleLines() ([]string, error) {
 		seen[idx] = struct{}{}
 
 		nodeAddr := uintptr(nodesTable) + uintptr(idx)*8
+		if err := ensureRemoteReadable(g.handle, nodeAddr, 6); err != nil {
+			return nil, fmt.Errorf("console node %d is unsafe: %w", idx, err)
+		}
 
 		strPtr, err := readRemoteUint32(g.handle, nodeAddr)
 		if err != nil {
@@ -367,6 +380,9 @@ func (g *GMod) ReadConsoleLines() ([]string, error) {
 
 		var line string
 		if strPtr != 0 {
+			if err := ensureRemoteReadable(g.handle, uintptr(strPtr), 1); err != nil {
+				return nil, fmt.Errorf("console line text pointer is unsafe: %w", err)
+			}
 			line, err = readRemoteCString(g.handle, uintptr(strPtr), maxConsoleLineLength)
 			if err != nil {
 				return nil, fmt.Errorf("read console line text: %w", err)
@@ -397,6 +413,71 @@ func RecentConsoleLines(lines []string, maxLines int) []string {
 		out[i] = lines[maxLines-1-i]
 	}
 	return out
+}
+
+// ConsoleDisplayLines converts the engine crash-buffer format into console-like text.
+func ConsoleDisplayLines(lines []string, maxLines int) []string {
+	recent := RecentConsoleLines(lines, 0)
+	display := make([]string, 0, len(recent))
+	for _, line := range recent {
+		clean := strings.TrimRight(stripConsoleDumpPrefix(line), "\r\n")
+		if strings.TrimSpace(clean) == "" {
+			continue
+		}
+		display = append(display, clean)
+	}
+	if maxLines > 0 && maxLines < len(display) {
+		return display[len(display)-maxLines:]
+	}
+	return display
+}
+
+func stripConsoleDumpPrefix(line string) string {
+	open := strings.IndexByte(line, '(')
+	if open <= 0 || !allDigits(line[:open]) {
+		return line
+	}
+	close := strings.IndexByte(line[open+1:], ')')
+	if close < 0 {
+		return line
+	}
+	close += open + 1
+	if close+1 >= len(line) || line[close+1] != ':' {
+		return line
+	}
+	if !looksLikeTimestamp(line[open+1 : close]) {
+		return line
+	}
+	return strings.TrimLeft(line[close+2:], " \t")
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikeTimestamp(s string) bool {
+	if s == "" {
+		return false
+	}
+	seenDot := false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r == '.' && !seenDot:
+			seenDot = true
+		default:
+			return false
+		}
+	}
+	return seenDot
 }
 
 // EngineConsoleRawGlobals returns the raw engine.dll values used for console history walking (debugging).
@@ -436,7 +517,12 @@ func (g *GMod) RunConsoleCommand(cmd string) error {
 	if err != nil {
 		return fmt.Errorf("allocate command buffer: %w", err)
 	}
-	defer freeRemote(g.handle, remoteCmd)
+	freeCmd := true
+	defer func() {
+		if freeCmd {
+			freeRemote(g.handle, remoteCmd)
+		}
+	}()
 
 	if err := writeRemote(g.handle, remoteCmd, append([]byte(cmd), 0)); err != nil {
 		return fmt.Errorf("write command: %w", err)
@@ -447,13 +533,22 @@ func (g *GMod) RunConsoleCommand(cmd string) error {
 	if err != nil {
 		return fmt.Errorf("allocate stub: %w", err)
 	}
-	defer freeRemote(g.handle, remoteStub)
+	freeStub := true
+	defer func() {
+		if freeStub {
+			freeRemote(g.handle, remoteStub)
+		}
+	}()
 
 	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
 		return fmt.Errorf("write stub: %w", err)
 	}
 
 	if _, err := remoteCall(g.handle, remoteStub, remoteCmd); err != nil {
+		if errors.Is(err, errRemoteThreadTimeout) {
+			freeCmd = false
+			freeStub = false
+		}
 		return fmt.Errorf("execute command: %w", err)
 	}
 
@@ -469,12 +564,20 @@ func (g *GMod) resolveEngineInterface() (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("find engine.dll CreateInterface: %w", err)
 	}
+	if err := ensureRemoteExecutable(g.handle, createInterface); err != nil {
+		return 0, fmt.Errorf("validate engine.dll CreateInterface: %w", err)
+	}
 
 	remoteName, err := allocRemote(g.handle, uintptr(len(engineInterfaceName)+1), pageReadwrite)
 	if err != nil {
 		return 0, fmt.Errorf("allocate interface name: %w", err)
 	}
-	defer freeRemote(g.handle, remoteName)
+	freeName := true
+	defer func() {
+		if freeName {
+			freeRemote(g.handle, remoteName)
+		}
+	}()
 
 	if err := writeRemote(g.handle, remoteName, append([]byte(engineInterfaceName), 0)); err != nil {
 		return 0, fmt.Errorf("write interface name: %w", err)
@@ -485,7 +588,12 @@ func (g *GMod) resolveEngineInterface() (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("allocate CreateInterface stub: %w", err)
 	}
-	defer freeRemote(g.handle, remoteStub)
+	freeStub := true
+	defer func() {
+		if freeStub {
+			freeRemote(g.handle, remoteStub)
+		}
+	}()
 
 	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
 		return 0, fmt.Errorf("write CreateInterface stub: %w", err)
@@ -493,7 +601,16 @@ func (g *GMod) resolveEngineInterface() (uint32, error) {
 
 	result, err := remoteCall(g.handle, remoteStub, remoteName)
 	if err != nil {
+		if errors.Is(err, errRemoteThreadTimeout) {
+			freeName = false
+			freeStub = false
+		}
 		return 0, fmt.Errorf("call CreateInterface: %w", err)
+	}
+	if result != 0 {
+		if err := ensureRemoteReadable(g.handle, result, 4); err != nil {
+			return 0, fmt.Errorf("%s returned unsafe interface pointer 0x%X: %w", engineInterfaceName, result, err)
+		}
 	}
 	g.engineIface = uint32(result)
 	return g.engineIface, nil
@@ -512,17 +629,30 @@ func (g *GMod) resolveConsoleGlobals() (consoleGlobals, error) {
 }
 
 func (g *GMod) callThiscallNoArg(method uint32, thisPtr uint32) (uintptr, error) {
+	if err := ensureRemoteExecutable(g.handle, uintptr(method)); err != nil {
+		return 0, fmt.Errorf("method pointer is unsafe: %w", err)
+	}
+
 	stub := buildThiscallNoArgStub(uintptr(method), uintptr(thisPtr))
 	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
 	if err != nil {
 		return 0, fmt.Errorf("allocate stub: %w", err)
 	}
-	defer freeRemote(g.handle, remoteStub)
+	freeStub := true
+	defer func() {
+		if freeStub {
+			freeRemote(g.handle, remoteStub)
+		}
+	}()
 
 	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
 		return 0, fmt.Errorf("write stub: %w", err)
 	}
-	return remoteCall(g.handle, remoteStub, 0)
+	result, err := remoteCall(g.handle, remoteStub, 0)
+	if errors.Is(err, errRemoteThreadTimeout) {
+		freeStub = false
+	}
+	return result, err
 }
 
 func (g *GMod) resolveClientCmd(ifacePtr uint32) (uint32, error) {
@@ -530,13 +660,22 @@ func (g *GMod) resolveClientCmd(ifacePtr uint32) (uint32, error) {
 }
 
 func (g *GMod) resolveEngineMethod(ifacePtr uint32, vtblOffset uintptr) (uint32, error) {
+	if err := ensureRemoteReadable(g.handle, uintptr(ifacePtr), 4); err != nil {
+		return 0, fmt.Errorf("interface pointer is unsafe: %w", err)
+	}
 	vtable, err := readRemoteUint32(g.handle, uintptr(ifacePtr))
 	if err != nil {
 		return 0, fmt.Errorf("read vtable: %w", err)
 	}
+	if err := ensureRemoteReadable(g.handle, uintptr(vtable)+vtblOffset, 4); err != nil {
+		return 0, fmt.Errorf("vtable entry at offset 0x%X is unsafe: %w", vtblOffset, err)
+	}
 	method, err := readRemoteUint32(g.handle, uintptr(vtable)+vtblOffset)
 	if err != nil {
 		return 0, fmt.Errorf("read method from vtable: %w", err)
+	}
+	if err := ensureRemoteExecutable(g.handle, uintptr(method)); err != nil {
+		return 0, fmt.Errorf("method at vtable offset 0x%X is unsafe: %w", vtblOffset, err)
 	}
 	return method, nil
 }

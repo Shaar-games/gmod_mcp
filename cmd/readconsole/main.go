@@ -20,9 +20,11 @@ func main() {
 	var pid uint64
 	var process string
 	var maxShow int
+	var raw bool
 	flag.Uint64Var(&pid, "pid", 0, "Garry's Mod PID (0 = auto)")
 	flag.StringVar(&process, "process", "", "Process name (default: gmod.exe)")
 	flag.IntVar(&maxShow, "lines", 100, "Print only the newest N lines (0 = all)")
+	flag.BoolVar(&raw, "raw", false, "Print raw engine console buffer entries")
 	flag.Parse()
 
 	conn, err := gmod.Connect(uint32(pid), process)
@@ -53,7 +55,10 @@ func main() {
 	total := len(lines)
 	fmt.Fprintf(os.Stderr, "total lines in chain: %d\n", total)
 
-	out := gmod.RecentConsoleLines(lines, maxShow)
+	out := gmod.ConsoleDisplayLines(lines, maxShow)
+	if raw {
+		out = gmod.RecentConsoleLines(lines, maxShow)
+	}
 
 	fmt.Println(strings.Join(out, "\n"))
 }

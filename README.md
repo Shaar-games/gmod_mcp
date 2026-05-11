@@ -216,7 +216,7 @@ Parameters:
 
 Reads the developer console history directly from `engine.dll` memory.
 
-It walks the same linked list used by the engine crash dump path for `-Console Buffer-`, then returns the newest lines in chronological order.
+It walks the same linked list used by the engine crash dump path for `-Console Buffer-`, then returns the newest display lines in chronological order. Internal crash-buffer prefixes and empty entries are filtered from the MCP output.
 
 Parameters:
 
@@ -294,13 +294,13 @@ Requirements:
 Create a release from the current branch:
 
 ```powershell
-.\release.cmd v1.3.0
+.\release.cmd v1.3.1
 ```
 
 Overwrite an existing release/tag intentionally:
 
 ```powershell
-.\release.cmd v1.3.0 --force
+.\release.cmd v1.3.1 --force
 ```
 
 The script:
@@ -352,12 +352,19 @@ Read console output from memory:
 go run ./cmd/readconsole -lines 50
 ```
 
+Print raw engine console buffer entries for debugging:
+
+```powershell
+go run ./cmd/readconsole -raw -lines 50
+```
+
 ## Technical Notes
 
 - `IVEngineClient015` is resolved dynamically by calling `engine.dll!CreateInterface` inside the target process.
 - `RunConsoleCommand` calls `IVEngineClient::ClientCmd` through the `IVEngineClient015` vtable.
 - `GetGameStatus` calls `IVEngineClient::IsInGame` and `IVEngineClient::GetMaxClients` through the same interface.
 - `GetConsoleOutput` signature-scans `engine.dll` for the console dump walker and extracts the runtime console-list globals from the matched instructions.
+- Remote calls validate readable/executable memory before use and time out instead of waiting indefinitely. If a timeout occurs, remote allocations are intentionally left in place so a still-running remote thread cannot execute freed memory.
 - The remaining vtable offsets are tied to the `IVEngineClient015` ABI instead of module RVAs.
 
 ## License

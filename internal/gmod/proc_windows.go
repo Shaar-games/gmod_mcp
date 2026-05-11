@@ -4,6 +4,7 @@ package gmod
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"unsafe"
@@ -16,6 +17,8 @@ const (
 	th32csSnapModule   = 0x00000008
 	th32csSnapModule32 = 0x00000010
 	infinite           = 0xFFFFFFFF
+	waitObject0        = 0x00000000
+	waitTimeout        = 0x00000102
 )
 
 type processEntry32 struct {
@@ -49,6 +52,16 @@ type moduleInfo struct {
 	Size uint32
 }
 
+type memoryBasicInformation struct {
+	BaseAddress       uintptr
+	AllocationBase    uintptr
+	AllocationProtect uint32
+	RegionSize        uintptr
+	State             uint32
+	Protect           uint32
+	Type              uint32
+}
+
 var (
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
@@ -61,6 +74,7 @@ var (
 	procCloseHandle              = kernel32.NewProc("CloseHandle")
 	procVirtualAllocEx           = kernel32.NewProc("VirtualAllocEx")
 	procVirtualFreeEx            = kernel32.NewProc("VirtualFreeEx")
+	procVirtualQueryEx           = kernel32.NewProc("VirtualQueryEx")
 	procWriteProcessMemory       = kernel32.NewProc("WriteProcessMemory")
 	procReadProcessMemory        = kernel32.NewProc("ReadProcessMemory")
 	procCreateRemoteThread       = kernel32.NewProc("CreateRemoteThread")
@@ -75,7 +89,18 @@ const (
 	memRelease           = 0x8000
 	pageReadwrite        = 0x04
 	pageExecuteReadwrite = 0x40
+	pageNoaccess         = 0x01
+	pageReadonly         = 0x02
+	pageWritecopy        = 0x08
+	pageExecute          = 0x10
+	pageExecuteRead      = 0x20
+	pageExecuteWritecopy = 0x80
+	pageGuard            = 0x100
+
+	defaultRemoteCallTimeoutMS = 5000
 )
+
+var errRemoteThreadTimeout = errors.New("remote thread timed out")
 
 func processAccessMask() uint32 {
 	return 0x0008 | 0x0010 | 0x0020 | 0x0002 | 0x0400 | 0x1000
@@ -154,6 +179,69 @@ func openTargetProcess(pid uint32) (windows.Handle, error) {
 		return windows.InvalidHandle, fmt.Errorf("OpenProcess: %w", err)
 	}
 	return h, nil
+}
+
+func queryRemoteMemory(h windows.Handle, addr uintptr) (memoryBasicInformation, error) {
+	var mbi memoryBasicInformation
+	n, _, err := procVirtualQueryEx.Call(
+		uintptr(h),
+		addr,
+		uintptr(unsafe.Pointer(&mbi)),
+		unsafe.Sizeof(mbi),
+	)
+	if n == 0 {
+		return memoryBasicInformation{}, fmt.Errorf("VirtualQueryEx(0x%X): %v", addr, err)
+	}
+	return mbi, nil
+}
+
+func remoteRangeAvailable(h windows.Handle, addr uintptr, size uintptr, executable bool) error {
+	if addr == 0 {
+		return fmt.Errorf("address is NULL")
+	}
+	if size == 0 {
+		size = 1
+	}
+
+	mbi, err := queryRemoteMemory(h, addr)
+	if err != nil {
+		return err
+	}
+	if mbi.State != memCommit {
+		return fmt.Errorf("address 0x%X is not committed memory", addr)
+	}
+	if mbi.Protect&pageGuard != 0 || mbi.Protect&pageNoaccess != 0 {
+		return fmt.Errorf("address 0x%X has inaccessible protection 0x%X", addr, mbi.Protect)
+	}
+	if executable && !isExecutableProtect(mbi.Protect) {
+		return fmt.Errorf("address 0x%X is not executable memory (protect=0x%X)", addr, mbi.Protect)
+	}
+	if !executable && !isReadableProtect(mbi.Protect) {
+		return fmt.Errorf("address 0x%X is not readable memory (protect=0x%X)", addr, mbi.Protect)
+	}
+
+	offset := addr - mbi.BaseAddress
+	if offset > mbi.RegionSize || size > mbi.RegionSize-offset {
+		return fmt.Errorf("range 0x%X..0x%X crosses memory region 0x%X..0x%X",
+			addr, addr+size, mbi.BaseAddress, mbi.BaseAddress+mbi.RegionSize)
+	}
+	return nil
+}
+
+func ensureRemoteReadable(h windows.Handle, addr uintptr, size uintptr) error {
+	return remoteRangeAvailable(h, addr, size, false)
+}
+
+func ensureRemoteExecutable(h windows.Handle, addr uintptr) error {
+	return remoteRangeAvailable(h, addr, 1, true)
+}
+
+func isReadableProtect(protect uint32) bool {
+	return protect&(pageReadonly|pageReadwrite|pageWritecopy|pageExecuteRead|pageExecuteReadwrite|pageExecuteWritecopy) != 0
+}
+
+func isExecutableProtect(protect uint32) bool {
+	return protect&(pageExecute|pageExecuteRead|pageExecuteReadwrite|pageExecuteWritecopy) != 0
 }
 
 func readRemoteUint32(h windows.Handle, addr uintptr) (uint32, error) {
@@ -292,16 +380,29 @@ func freeRemote(h windows.Handle, addr uintptr) {
 }
 
 func remoteCall(h windows.Handle, fn uintptr, arg uintptr) (uintptr, error) {
+	if err := ensureRemoteExecutable(h, fn); err != nil {
+		return 0, fmt.Errorf("remote call target is unsafe: %w", err)
+	}
+
 	thread, _, err := procCreateRemoteThread.Call(uintptr(h), 0, 0, fn, arg, 0, 0)
 	if thread == 0 {
 		return 0, fmt.Errorf("CreateRemoteThread: %v", err)
 	}
 	defer procCloseHandle.Call(thread)
 
-	procWaitForSingleObject.Call(thread, infinite)
+	wait, _, waitErr := procWaitForSingleObject.Call(thread, defaultRemoteCallTimeoutMS)
+	if wait == waitTimeout {
+		return 0, fmt.Errorf("%w after %dms", errRemoteThreadTimeout, defaultRemoteCallTimeoutMS)
+	}
+	if wait != waitObject0 {
+		return 0, fmt.Errorf("WaitForSingleObject: return=%d err=%v", wait, waitErr)
+	}
 
 	var exitCode uintptr
-	procGetExitCodeThread.Call(thread, uintptr(unsafe.Pointer(&exitCode)))
+	ok, _, exitErr := procGetExitCodeThread.Call(thread, uintptr(unsafe.Pointer(&exitCode)))
+	if ok == 0 {
+		return 0, fmt.Errorf("GetExitCodeThread: %v", exitErr)
+	}
 	return exitCode, nil
 }
 

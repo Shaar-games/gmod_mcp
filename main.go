@@ -34,7 +34,7 @@ import (
 
 const (
 	serverName    = "gmod-mcp"
-	serverVersion = "1.3.0"
+	serverVersion = "1.3.1"
 )
 
 type processTarget struct {
@@ -243,13 +243,13 @@ func handleGetConsoleOutput(ctx context.Context, req *mcp.CallToolRequest, input
 	}
 
 	total := len(allLines)
-	picked := gmod.RecentConsoleLines(allLines, maxLines)
+	picked := gmod.ConsoleDisplayLines(allLines, maxLines)
 
 	return nil, GetConsoleOutputOutput{
 		Success: true,
 		Message: fmt.Sprintf(
-			"Read %d console lines from engine.dll memory (showing newest %d of %d total, PID %d)",
-			len(picked), len(picked), total, conn.PID(),
+			"Read %d console buffer entries from engine.dll memory (showing newest %d display lines, PID %d)",
+			total, len(picked), conn.PID(),
 		),
 		PID:     conn.PID(),
 		Lines:   len(picked),
