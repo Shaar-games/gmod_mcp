@@ -6,6 +6,7 @@ package gmod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,8 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+var ErrProcessNotFound = errors.New("game process not found")
 
 const (
 	defaultProcessName = "gmod.exe"
@@ -105,7 +108,10 @@ func Status(processName string) (GameStatus, error) {
 
 	pids, err := findAllProcessIDsByName(exe)
 	if err != nil {
-		return status, nil
+		if errors.Is(err, ErrProcessNotFound) {
+			return status, nil
+		}
+		return status, fmt.Errorf("enumerate %s processes: %w", exe, err)
 	}
 	status.Running = len(pids) > 0
 	status.SessionType = "menu"
@@ -221,7 +227,11 @@ func Connect(pid uint32, processName string) (*GMod, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve PID: %w", err)
 	}
+	return connectProcess(resolvedPID, processAccessMask())
+}
 
+// connectProcess is shared by command connections and the read-only lifecycle watcher.
+func connectProcess(resolvedPID uint32, access uint32) (*GMod, error) {
 	clientInfo, err := findModuleInfo(resolvedPID, "client.dll")
 	if err != nil {
 		return nil, fmt.Errorf("find client.dll: %w", err)
@@ -232,7 +242,7 @@ func Connect(pid uint32, processName string) (*GMod, error) {
 		return nil, fmt.Errorf("find engine.dll: %w", err)
 	}
 
-	h, err := openTargetProcess(resolvedPID)
+	h, err := windows.OpenProcess(access, false, resolvedPID)
 	if err != nil {
 		return nil, fmt.Errorf("open process: %w", err)
 	}
@@ -276,7 +286,14 @@ func (g *GMod) EngineInterfaceReady() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("resolve engine interface: %w", err)
 	}
-	return ifacePtr != 0, nil
+	if ifacePtr == 0 {
+		return false, nil
+	}
+	method, err := g.resolveClientCmd(ifacePtr)
+	if err != nil {
+		return false, err
+	}
+	return method != 0, nil
 }
 
 // IsInGame calls IVEngineClient::IsInGame in the target process.
@@ -326,6 +343,22 @@ func (g *GMod) MaxPlayers() (int, error) {
 // ReadConsoleLines walks the engine.dll console history linked list in remote memory.
 // The engine chain is newest-first on the Garry's Mod build this package targets.
 func (g *GMod) ReadConsoleLines() ([]string, error) {
+	return g.readConsoleLines(0)
+}
+
+// ReadRecentConsoleLines limits the memory walk and returns chronological output.
+func (g *GMod) ReadRecentConsoleLines(maxLines int) ([]string, error) {
+	if maxLines <= 0 {
+		return nil, fmt.Errorf("maxLines must be positive")
+	}
+	lines, err := g.readConsoleLines(maxLines)
+	if err != nil {
+		return nil, err
+	}
+	return RecentConsoleLines(lines, maxLines), nil
+}
+
+func (g *GMod) readConsoleLines(limit int) ([]string, error) {
 	globals, err := g.resolveConsoleGlobals()
 	if err != nil {
 		return nil, err
@@ -353,6 +386,9 @@ func (g *GMod) ReadConsoleLines() ([]string, error) {
 	seen := make(map[uint16]struct{}, 256)
 
 	for step := 0; step < maxConsoleWalk; step++ {
+		if limit > 0 && len(lines) >= limit {
+			break
+		}
 		if _, dup := seen[idx]; dup {
 			return nil, fmt.Errorf("console chain cycle detected at index %d", idx)
 		}
@@ -413,10 +449,11 @@ func (g *GMod) EngineConsoleRawGlobals() (nodesTablePtr uint32, chainWord uint32
 	return nodesTablePtr, chainWord, err
 }
 
-// RunConsoleCommand executes a console command in the Garry's Mod process.
+// RunConsoleCommand submits a command to ClientCmd. Use ExecuteConsoleCommand
+// when engine-side execution confirmation and console errors are required.
 func (g *GMod) RunConsoleCommand(cmd string) error {
-	if strings.TrimSpace(cmd) == "" {
-		return fmt.Errorf("command cannot be empty")
+	if strings.TrimSpace(cmd) == "" || strings.ContainsRune(cmd, 0) {
+		return fmt.Errorf("command must be nonempty and contain no NUL bytes")
 	}
 
 	ifacePtr, err := g.resolveEngineInterface()
@@ -432,32 +469,16 @@ func (g *GMod) RunConsoleCommand(cmd string) error {
 		return fmt.Errorf("resolve ClientCmd: %w", err)
 	}
 
-	remoteCmd, err := allocRemote(g.handle, uintptr(len(cmd)+1), pageReadwrite)
-	if err != nil {
-		return fmt.Errorf("allocate command buffer: %w", err)
-	}
-	defer freeRemote(g.handle, remoteCmd)
-
-	if err := writeRemote(g.handle, remoteCmd, append([]byte(cmd), 0)); err != nil {
-		return fmt.Errorf("write command: %w", err)
-	}
-
 	stub := buildClientCmdStub(uintptr(clientCmdAddr), uintptr(ifacePtr))
-	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
-	if err != nil {
-		return fmt.Errorf("allocate stub: %w", err)
-	}
-	defer freeRemote(g.handle, remoteStub)
-
-	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
-		return fmt.Errorf("write stub: %w", err)
-	}
-
-	if _, err := remoteCall(g.handle, remoteStub, remoteCmd); err != nil {
+	if _, err := runRemoteStub(g.handle, g.pid, stub, append([]byte(cmd), 0)); err != nil {
 		return fmt.Errorf("execute command: %w", err)
 	}
 
 	return nil
+}
+
+func (g *GMod) ExecuteConsoleCommand(ctx context.Context, command string, timeout time.Duration) (CommandResult, error) {
+	return executeConsoleCommand(ctx, g, command, timeout)
 }
 
 func (g *GMod) resolveEngineInterface() (uint32, error) {
@@ -470,28 +491,8 @@ func (g *GMod) resolveEngineInterface() (uint32, error) {
 		return 0, fmt.Errorf("find engine.dll CreateInterface: %w", err)
 	}
 
-	remoteName, err := allocRemote(g.handle, uintptr(len(engineInterfaceName)+1), pageReadwrite)
-	if err != nil {
-		return 0, fmt.Errorf("allocate interface name: %w", err)
-	}
-	defer freeRemote(g.handle, remoteName)
-
-	if err := writeRemote(g.handle, remoteName, append([]byte(engineInterfaceName), 0)); err != nil {
-		return 0, fmt.Errorf("write interface name: %w", err)
-	}
-
 	stub := buildCreateInterfaceStub(createInterface)
-	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
-	if err != nil {
-		return 0, fmt.Errorf("allocate CreateInterface stub: %w", err)
-	}
-	defer freeRemote(g.handle, remoteStub)
-
-	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
-		return 0, fmt.Errorf("write CreateInterface stub: %w", err)
-	}
-
-	result, err := remoteCall(g.handle, remoteStub, remoteName)
+	result, err := runRemoteStub(g.handle, g.pid, stub, append([]byte(engineInterfaceName), 0))
 	if err != nil {
 		return 0, fmt.Errorf("call CreateInterface: %w", err)
 	}
@@ -513,16 +514,7 @@ func (g *GMod) resolveConsoleGlobals() (consoleGlobals, error) {
 
 func (g *GMod) callThiscallNoArg(method uint32, thisPtr uint32) (uintptr, error) {
 	stub := buildThiscallNoArgStub(uintptr(method), uintptr(thisPtr))
-	remoteStub, err := allocRemote(g.handle, uintptr(len(stub)), pageExecuteReadwrite)
-	if err != nil {
-		return 0, fmt.Errorf("allocate stub: %w", err)
-	}
-	defer freeRemote(g.handle, remoteStub)
-
-	if err := writeRemote(g.handle, remoteStub, stub); err != nil {
-		return 0, fmt.Errorf("write stub: %w", err)
-	}
-	return remoteCall(g.handle, remoteStub, 0)
+	return runRemoteStub(g.handle, g.pid, stub, nil)
 }
 
 func (g *GMod) resolveClientCmd(ifacePtr uint32) (uint32, error) {

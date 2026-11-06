@@ -34,7 +34,7 @@ import (
 
 const (
 	serverName    = "gmod-mcp"
-	serverVersion = "1.3.0"
+	serverVersion = "1.4.0"
 )
 
 type processTarget struct {
@@ -51,7 +51,8 @@ func connectToGMod(target processTarget) (*gmod.GMod, error) {
 }
 
 type RunConsoleCommandInput struct {
-	Command string `json:"command"       jsonschema:"The Source Engine console command to execute"`
+	Command        string `json:"command"       jsonschema:"The Source Engine console command to execute"`
+	TimeoutSeconds int    `json:"timeoutSeconds,omitempty" jsonschema:"Maximum confirmation/capture wait in seconds (default: 5, max: 30); native submission also has bounded waits"`
 	processTarget
 }
 
@@ -70,7 +71,7 @@ func handleGetGameStatus(ctx context.Context, req *mcp.CallToolRequest, input Ge
 ) {
 	status, err := gmod.Status(input.ProcessName)
 	if err != nil {
-		return nil, GetGameStatusOutput{
+		return &mcp.CallToolResult{IsError: true}, GetGameStatusOutput{
 			Success: false,
 			Message: fmt.Sprintf("Failed to check Garry's Mod status: %v", err),
 			Status:  status,
@@ -156,48 +157,74 @@ func handleLaunchGame(ctx context.Context, req *mcp.CallToolRequest, input Launc
 }
 
 type RunConsoleCommandOutput struct {
-	Success bool   `json:"success"   jsonschema:"Whether the command was executed successfully"`
+	Success bool   `json:"success"   jsonschema:"Whether engine execution was confirmed without a recognized console error"`
 	Message string `json:"message"   jsonschema:"Human-readable result message"`
 	PID     uint32 `json:"pid"       jsonschema:"The process ID the command was sent to"`
 	Command string `json:"command"   jsonschema:"The command that was executed"`
+	gmod.CommandResult
+}
+
+type consoleCommander interface {
+	PID() uint32
+	ExecuteConsoleCommand(context.Context, string, time.Duration) (gmod.CommandResult, error)
+}
+
+func commandToolResponse(output RunConsoleCommandOutput) (*mcp.CallToolResult, RunConsoleCommandOutput, error) {
+	return &mcp.CallToolResult{IsError: !output.Success}, output, nil
+}
+
+func runConfirmedConsoleCommand(ctx context.Context, conn consoleCommander, command string, timeout time.Duration) RunConsoleCommandOutput {
+	result, err := conn.ExecuteConsoleCommand(ctx, command, timeout)
+	output := RunConsoleCommandOutput{PID: conn.PID(), Command: command, CommandResult: result}
+	if err != nil {
+		output.Message = fmt.Sprintf("Could not confirm command execution: %v", err)
+		output.CaptureError = err.Error()
+		return output
+	}
+	output.Success = result.Status == "executed"
+	switch result.Status {
+	case "executed":
+		output.Message = "Engine processed the command; no recognized console errors were observed"
+	case "error":
+		output.Message = "Command reported a console error; see errors and output"
+	default:
+		output.Message = "Command execution could not be confirmed; see captureError and output"
+	}
+	return output
 }
 
 func handleRunConsoleCommand(ctx context.Context, req *mcp.CallToolRequest, input RunConsoleCommandInput) (
 	*mcp.CallToolResult, RunConsoleCommandOutput, error,
 ) {
 	cmd := strings.TrimSpace(input.Command)
-	if cmd == "" {
-		return nil, RunConsoleCommandOutput{
-			Success: false,
-			Message: "Command cannot be empty",
-		}, nil
+	if cmd == "" || strings.ContainsRune(cmd, 0) {
+		return commandToolResponse(RunConsoleCommandOutput{
+			Success:       false,
+			Message:       "Command must be nonempty and contain no NUL bytes",
+			Command:       cmd,
+			CommandResult: gmod.CommandResult{Status: "error", Errors: []string{"Invalid command"}},
+		})
 	}
 
 	conn, err := connectToGMod(input.processTarget)
 	if err != nil {
-		return nil, RunConsoleCommandOutput{
-			Success: false,
-			Message: fmt.Sprintf("Failed to connect to Garry's Mod: %v", err),
-			Command: cmd,
-		}, nil
+		return commandToolResponse(RunConsoleCommandOutput{
+			Success:       false,
+			Message:       fmt.Sprintf("Failed to connect to Garry's Mod: %v", err),
+			Command:       cmd,
+			CommandResult: gmod.CommandResult{Status: "error", Errors: []string{err.Error()}},
+		})
 	}
 	defer conn.Close()
 
-	if err := conn.RunConsoleCommand(cmd); err != nil {
-		return nil, RunConsoleCommandOutput{
-			Success: false,
-			Message: fmt.Sprintf("Failed to execute command: %v", err),
-			PID:     conn.PID(),
-			Command: cmd,
-		}, nil
+	timeout := input.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = 5
 	}
-
-	return nil, RunConsoleCommandOutput{
-		Success: true,
-		Message: fmt.Sprintf("Command '%s' executed successfully in Garry's Mod (PID: %d)", cmd, conn.PID()),
-		PID:     conn.PID(),
-		Command: cmd,
-	}, nil
+	if timeout > 30 {
+		timeout = 30
+	}
+	return commandToolResponse(runConfirmedConsoleCommand(ctx, conn, cmd, time.Duration(timeout)*time.Second))
 }
 
 type GetConsoleOutputInput struct {
@@ -258,10 +285,22 @@ func handleGetConsoleOutput(ctx context.Context, req *mcp.CallToolRequest, input
 }
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	history := &gmod.EventHistory{}
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
 		Version: serverVersion,
-	}, nil)
+	}, &mcp.ServerOptions{
+		Instructions: "Garry's Mod readiness, responsiveness and stop/crash events are retained by GetGameEvents and gmod://events. " +
+			"Subscribe to gmod://events for resource updates, or send logging/setLevel with notice (or lower) for lifecycle log notifications. " +
+			"A game_crashed event indicates an abnormal exit or new crash report; external termination can also cause an abnormal exit.",
+		SubscribeHandler:   validateGameEventsSubscription,
+		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error { return nil },
+	})
+	registerGameEvents(server, history)
+	registerCrashReport(server)
+	registerExperiment(server, history)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "GetGameStatus",
@@ -281,6 +320,7 @@ func main() {
 		Name: "RunConsoleCommand",
 		Description: "Execute a console command in a running Garry's Mod (Source Engine) process. " +
 			"Uses remote thread injection to call ClientCmd on the IVEngineClient015 interface. " +
+			"Waits for engine-side execution markers and returns console output, recognized errors, and status executed/error/unconfirmed. " +
 			"Use this to run any Source Engine console command such as 'say Hello', 'sv_cheats 1', " +
 			"'bot_add', 'changelevel gm_construct', etc.",
 	}, handleRunConsoleCommand)
@@ -293,7 +333,17 @@ func main() {
 	}, handleGetConsoleOutput)
 
 	log.Printf("Starting %s MCP server (stdio transport)...", serverName)
-	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		gmod.WatchGame(ctx, func(event gmod.GameEvent) {
+			publishGameEvent(ctx, server, history, event)
+		})
+	}()
+	err := server.Run(ctx, &mcp.StdioTransport{})
+	cancel()
+	<-watchDone
+	if err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }

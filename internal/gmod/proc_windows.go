@@ -47,6 +47,7 @@ type moduleEntry32W struct {
 type moduleInfo struct {
 	Base uintptr
 	Size uint32
+	Path string
 }
 
 var (
@@ -64,7 +65,6 @@ var (
 	procWriteProcessMemory       = kernel32.NewProc("WriteProcessMemory")
 	procReadProcessMemory        = kernel32.NewProc("ReadProcessMemory")
 	procCreateRemoteThread       = kernel32.NewProc("CreateRemoteThread")
-	procWaitForSingleObject      = kernel32.NewProc("WaitForSingleObject")
 	procGetExitCodeThread        = kernel32.NewProc("GetExitCodeThread")
 	procShellExecute             = shell32.NewProc("ShellExecuteW")
 )
@@ -95,9 +95,9 @@ func findAllProcessIDsByName(name string) ([]uint32, error) {
 
 	var pe processEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
-	ok, _, _ := procProcess32First.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	ok, _, firstErr := procProcess32First.Call(snap, uintptr(unsafe.Pointer(&pe)))
 	if ok == 0 {
-		return nil, fmt.Errorf("Process32First: %v", err)
+		return nil, fmt.Errorf("Process32First: %v", firstErr)
 	}
 
 	var matches []uint32
@@ -105,12 +105,17 @@ func findAllProcessIDsByName(name string) ([]uint32, error) {
 		if strings.EqualFold(strings.TrimSpace(windows.UTF16ToString(pe.ExeFile[:])), want) {
 			matches = append(matches, pe.ProcessID)
 		}
-		if ok, _, _ = procProcess32Next.Call(snap, uintptr(unsafe.Pointer(&pe))); ok == 0 {
+		var nextErr error
+		ok, _, nextErr = procProcess32Next.Call(snap, uintptr(unsafe.Pointer(&pe)))
+		if ok == 0 {
+			if nextErr != nil && nextErr != windows.ERROR_NO_MORE_FILES {
+				return nil, fmt.Errorf("Process32Next: %w", nextErr)
+			}
 			break
 		}
 	}
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("process %q not found", name)
+		return nil, fmt.Errorf("%w: %q", ErrProcessNotFound, name)
 	}
 	return matches, nil
 }
@@ -139,21 +144,13 @@ func findModuleInfo(pid uint32, module string) (moduleInfo, error) {
 	}
 	for {
 		if strings.ToLower(windows.UTF16ToString(me.SzModule[:])) == want {
-			return moduleInfo{Base: me.ModBaseAddr, Size: me.ModBaseSize}, nil
+			return moduleInfo{Base: me.ModBaseAddr, Size: me.ModBaseSize, Path: windows.UTF16ToString(me.SzExePath[:])}, nil
 		}
 		if ok, _, _ = procModule32Next.Call(snap, uintptr(unsafe.Pointer(&me))); ok == 0 {
 			break
 		}
 	}
 	return moduleInfo{}, fmt.Errorf("module %q not loaded in pid %d", module, pid)
-}
-
-func openTargetProcess(pid uint32) (windows.Handle, error) {
-	h, err := windows.OpenProcess(processAccessMask(), false, pid)
-	if err != nil {
-		return windows.InvalidHandle, fmt.Errorf("OpenProcess: %w", err)
-	}
-	return h, nil
 }
 
 func readRemoteUint32(h windows.Handle, addr uintptr) (uint32, error) {
@@ -289,20 +286,6 @@ func writeRemote(h windows.Handle, addr uintptr, data []byte) error {
 
 func freeRemote(h windows.Handle, addr uintptr) {
 	procVirtualFreeEx.Call(uintptr(h), addr, 0, memRelease)
-}
-
-func remoteCall(h windows.Handle, fn uintptr, arg uintptr) (uintptr, error) {
-	thread, _, err := procCreateRemoteThread.Call(uintptr(h), 0, 0, fn, arg, 0, 0)
-	if thread == 0 {
-		return 0, fmt.Errorf("CreateRemoteThread: %v", err)
-	}
-	defer procCloseHandle.Call(thread)
-
-	procWaitForSingleObject.Call(thread, infinite)
-
-	var exitCode uintptr
-	procGetExitCodeThread.Call(thread, uintptr(unsafe.Pointer(&exitCode)))
-	return exitCode, nil
 }
 
 func shellOpen(target string) error {
